@@ -204,12 +204,17 @@ def bench_cute_dsl(
     use_cuda_graph=True,
     use_cupti=True,
     use_wrapper=False,
+    nvtx_profile_region=False,
 ):
     """Benchmark CuteDSL MoE.
 
     Args:
         use_wrapper: If True, use CuteDslMoEWrapper API (recommended for CUDA graph).
                     If False, use cute_dsl_fused_moe_nvfp4 functional API.
+        nvtx_profile_region: If True, wrap the bench_gpu_time measurement with
+                    cudaProfilerStart/Stop + an outer NVTX range so an nsys
+                    capture-range=cudaProfilerApi run records only the
+                    measurement iters (pre-warm / autotune excluded).
     """
     from flashinfer.fused_moe import fused_topk_deepseek
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
@@ -276,61 +281,74 @@ def bench_cute_dsl(
         )
 
         def run(x, x_sf, router_logits, routing_bias, topk_values, topk_indices):
-            fused_topk_deepseek(
-                scores=router_logits,
-                bias=routing_bias,
-                n_group=CFG.n_group,
-                topk_group=CFG.topk_group,
-                topk=CFG.top_k,
-                routed_scaling_factor=CFG.routed_scaling_factor,
-                topk_values=topk_values,
-                topk_indices=topk_indices,
-            )
-            return moe.run(
-                x=x,
-                x_sf=x_sf,
-                token_selected_experts=topk_indices,
-                token_final_scales=topk_values,
-                w1_weight=w1q,
-                w1_weight_sf=w1s,
-                w1_alpha=alpha,
-                fc2_input_scale=fc2sc,
-                w2_weight=w2q,
-                w2_weight_sf=w2s,
-                w2_alpha=alpha,
-            )
+            # Fine-grained NVTX markers:
+            #   `iter_cutedsl` wraps a single bench iter (topk + moe).
+            #   `topk_cutedsl` wraps the routing kernel.
+            #   `moe_cutedsl` wraps the MoE call (gather+GEMM1+SiLU+GEMM2+finalize).
+            # NVTX push/pop overhead is sub-microsecond, so these are always
+            # emitted even when nsys is not attached.
+            with torch.cuda.nvtx.range("iter_cutedsl"):
+                with torch.cuda.nvtx.range("topk_cutedsl"):
+                    fused_topk_deepseek(
+                        scores=router_logits,
+                        bias=routing_bias,
+                        n_group=CFG.n_group,
+                        topk_group=CFG.topk_group,
+                        topk=CFG.top_k,
+                        routed_scaling_factor=CFG.routed_scaling_factor,
+                        topk_values=topk_values,
+                        topk_indices=topk_indices,
+                    )
+                with torch.cuda.nvtx.range("moe_cutedsl"):
+                    return moe.run(
+                        x=x,
+                        x_sf=x_sf,
+                        token_selected_experts=topk_indices,
+                        token_final_scales=topk_values,
+                        w1_weight=w1q,
+                        w1_weight_sf=w1s,
+                        w1_alpha=alpha,
+                        fc2_input_scale=fc2sc,
+                        w2_weight=w2q,
+                        w2_weight_sf=w2s,
+                        w2_alpha=alpha,
+                    )
     else:
         # Use functional API
         from flashinfer import cute_dsl_fused_moe_nvfp4
 
         def run(x, x_sf, router_logits, routing_bias, topk_values, topk_indices):
-            fused_topk_deepseek(
-                scores=router_logits,
-                bias=routing_bias,
-                n_group=CFG.n_group,
-                topk_group=CFG.topk_group,
-                topk=CFG.top_k,
-                routed_scaling_factor=CFG.routed_scaling_factor,
-                topk_values=topk_values,
-                topk_indices=topk_indices,
-            )
-            return cute_dsl_fused_moe_nvfp4(
-                x=x,
-                x_sf=x_sf,
-                token_selected_experts=topk_indices,
-                token_final_scales=topk_values,
-                w1_weight=w1q,
-                w1_weight_sf=w1s,
-                w1_alpha=alpha,
-                fc2_input_scale=fc2sc,
-                w2_weight=w2q,
-                w2_weight_sf=w2s,
-                w2_alpha=alpha,
-                num_experts=CFG.num_experts,
-                top_k=CFG.top_k,
-                num_local_experts=num_local_experts,
-                local_expert_offset=local_expert_offset,
-            )
+            # See wrapper-path NVTX note above.
+            with torch.cuda.nvtx.range("iter_cutedsl"):
+                with torch.cuda.nvtx.range("topk_cutedsl"):
+                    fused_topk_deepseek(
+                        scores=router_logits,
+                        bias=routing_bias,
+                        n_group=CFG.n_group,
+                        topk_group=CFG.topk_group,
+                        topk=CFG.top_k,
+                        routed_scaling_factor=CFG.routed_scaling_factor,
+                        topk_values=topk_values,
+                        topk_indices=topk_indices,
+                    )
+                with torch.cuda.nvtx.range("moe_cutedsl"):
+                    return cute_dsl_fused_moe_nvfp4(
+                        x=x,
+                        x_sf=x_sf,
+                        token_selected_experts=topk_indices,
+                        token_final_scales=topk_values,
+                        w1_weight=w1q,
+                        w1_weight_sf=w1s,
+                        w1_alpha=alpha,
+                        fc2_input_scale=fc2sc,
+                        w2_weight=w2q,
+                        w2_weight_sf=w2s,
+                        w2_alpha=alpha,
+                        num_experts=CFG.num_experts,
+                        top_k=CFG.top_k,
+                        num_local_experts=num_local_experts,
+                        local_expert_offset=local_expert_offset,
+                    )
 
     # Pass input tensors via input_kwargs for cold L2 cache rotation
     input_kwargs = {
@@ -351,15 +369,38 @@ def bench_cute_dsl(
     run(**input_kwargs)
     torch.cuda.synchronize()
 
-    times = bench_gpu_time(
-        run,
-        dry_run_iters=warmup,
-        repeat_iters=iters,
-        cold_l2_cache=True,
-        enable_cupti=use_cupti,
-        use_cuda_graph=use_cuda_graph,
-        input_kwargs=input_kwargs,
-    )
+    # When `nvtx_profile_region` is set, additionally wrap the measurement
+    # region with cudaProfilerStart/Stop + an outer NVTX range so an
+    # `nsys profile --capture-range=cudaProfilerApi ...` run records only
+    # the measurement iters (not the pre-warm / autotune above).  The
+    # outer range is named `bench_cutedsl_n{n}`; the fine-grained `iter_`,
+    # `topk_`, `moe_` ranges emitted inside `run()` nest within it.
+    # cudaProfilerStop is in try/finally so it always fires.
+    def _timed():
+        return bench_gpu_time(
+            run,
+            dry_run_iters=warmup,
+            repeat_iters=iters,
+            cold_l2_cache=True,
+            enable_cupti=use_cupti,
+            use_cuda_graph=use_cuda_graph,
+            input_kwargs=input_kwargs,
+        )
+
+    if nvtx_profile_region:
+        torch.cuda.cudart().cudaProfilerStart()
+        try:
+            with torch.cuda.nvtx.range(f"bench_cutedsl_n{n}"):
+                times = _timed()
+        finally:
+            torch.cuda.cudart().cudaProfilerStop()
+        print(
+            f"[nvtx] bench_cutedsl_n{n}: captured iters={len(times)}, "
+            f"median={float(np.median(times)):.3f} ms",
+            flush=True,
+        )
+    else:
+        times = _timed()
     return np.median(times)
 
 
@@ -371,7 +412,13 @@ def bench_cutlass(
     local_expert_offset=0,
     use_cuda_graph=True,
     use_cupti=True,
+    nvtx_profile_region=False,
 ):
+    """Benchmark CUTLASS MoE.
+
+    Args:
+        nvtx_profile_region: See ``bench_cute_dsl`` for the NVTX-region rationale.
+    """
     from flashinfer.fused_moe import fused_topk_deepseek, cutlass_fused_moe
     from flashinfer.fp4_quantization import fp4_quantize
     from flashinfer.testing.utils import bench_gpu_time
@@ -423,31 +470,34 @@ def bench_cutlass(
     ep_size = CFG.num_experts // num_local_experts
 
     def run(hidden, sf, router_logits, routing_bias, topk_values, topk_indices):
-        # Routing (included in timing for fair comparison with TRTLLM)
-        fused_topk_deepseek(
-            scores=router_logits,
-            bias=routing_bias,
-            n_group=CFG.n_group,
-            topk_group=CFG.topk_group,
-            topk=CFG.top_k,
-            routed_scaling_factor=CFG.routed_scaling_factor,
-            topk_values=topk_values,
-            topk_indices=topk_indices,
-        )
-        cutlass_fused_moe(
-            hidden,
-            topk_indices.to(torch.int),
-            topk_values,
-            w1_fp4_view,
-            w2_fp4_view,
-            torch.bfloat16,
-            quant_scales=quant_scales,
-            input_sf=sf,
-            output=output,
-            ep_size=ep_size,
-            ep_rank=0,  # Simulating rank 0 of EP
-        )
-        return output
+        # See bench_cute_dsl for NVTX rationale.
+        with torch.cuda.nvtx.range("iter_cutlass"):
+            with torch.cuda.nvtx.range("topk_cutlass"):
+                fused_topk_deepseek(
+                    scores=router_logits,
+                    bias=routing_bias,
+                    n_group=CFG.n_group,
+                    topk_group=CFG.topk_group,
+                    topk=CFG.top_k,
+                    routed_scaling_factor=CFG.routed_scaling_factor,
+                    topk_values=topk_values,
+                    topk_indices=topk_indices,
+                )
+            with torch.cuda.nvtx.range("moe_cutlass"):
+                cutlass_fused_moe(
+                    hidden,
+                    topk_indices.to(torch.int),
+                    topk_values,
+                    w1_fp4_view,
+                    w2_fp4_view,
+                    torch.bfloat16,
+                    quant_scales=quant_scales,
+                    input_sf=sf,
+                    output=output,
+                    ep_size=ep_size,
+                    ep_rank=0,  # Simulating rank 0 of EP
+                )
+            return output
 
     input_kwargs = {
         "hidden": hidden_fp4,
@@ -462,15 +512,32 @@ def bench_cutlass(
     run(**input_kwargs)
     torch.cuda.synchronize()
 
-    times = bench_gpu_time(
-        run,
-        dry_run_iters=warmup,
-        repeat_iters=iters,
-        cold_l2_cache=True,
-        enable_cupti=use_cupti,
-        use_cuda_graph=use_cuda_graph,
-        input_kwargs=input_kwargs,
-    )
+    # See bench_cute_dsl for commentary on the optional NVTX wrap.
+    def _timed():
+        return bench_gpu_time(
+            run,
+            dry_run_iters=warmup,
+            repeat_iters=iters,
+            cold_l2_cache=True,
+            enable_cupti=use_cupti,
+            use_cuda_graph=use_cuda_graph,
+            input_kwargs=input_kwargs,
+        )
+
+    if nvtx_profile_region:
+        torch.cuda.cudart().cudaProfilerStart()
+        try:
+            with torch.cuda.nvtx.range(f"bench_cutlass_n{n}"):
+                times = _timed()
+        finally:
+            torch.cuda.cudart().cudaProfilerStop()
+        print(
+            f"[nvtx] bench_cutlass_n{n}: captured iters={len(times)}, "
+            f"median={float(np.median(times)):.3f} ms",
+            flush=True,
+        )
+    else:
+        times = _timed()
     return np.median(times)
 
 
@@ -482,7 +549,13 @@ def bench_trtllm(
     local_expert_offset=0,
     use_cuda_graph=True,
     use_cupti=True,
+    nvtx_profile_region=False,
 ):
+    """Benchmark TRT-LLM-Gen MoE.
+
+    Args:
+        nvtx_profile_region: See ``bench_cute_dsl`` for the NVTX-region rationale.
+    """
     from flashinfer.fused_moe import trtllm_fp4_block_scale_moe, RoutingMethodType
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices,
@@ -551,34 +624,41 @@ def bench_trtllm(
     sc = torch.ones(num_local_experts, device=dev, dtype=torch.float32)
 
     def run(routing_logits, routing_bias, hidden_states, hidden_states_scale):
-        return trtllm_fp4_block_scale_moe(
-            routing_logits=routing_logits,
-            routing_bias=routing_bias,
-            hidden_states=hidden_states,
-            hidden_states_scale=hidden_states_scale,
-            gemm1_weights=w1f,
-            gemm1_weights_scale=w1s,
-            gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=None,
-            gemm2_weights=w2f,
-            gemm2_weights_scale=w2s,
-            gemm2_bias=None,
-            output1_scale_scalar=sc,
-            output1_scale_gate_scalar=sc,
-            output2_scale_scalar=sc,
-            num_experts=CFG.num_experts,
-            top_k=CFG.top_k,
-            n_group=CFG.n_group,
-            topk_group=CFG.topk_group,
-            intermediate_size=CFG.intermediate_size,
-            local_expert_offset=local_expert_offset,
-            local_num_experts=num_local_experts,
-            routed_scaling_factor=CFG.routed_scaling_factor,
-            routing_method_type=RoutingMethodType.DeepSeekV3,
-            do_finalize=True,
-        )
+        # TRT-LLM's routing is internal to the kernel, so `iter_trtllm`
+        # and `moe_trtllm` cover the same work.  Both are emitted so the
+        # parser can treat TRT-LLM symmetrically with the other backends.
+        with (
+            torch.cuda.nvtx.range("iter_trtllm"),
+            torch.cuda.nvtx.range("moe_trtllm"),
+        ):
+            return trtllm_fp4_block_scale_moe(
+                routing_logits=routing_logits,
+                routing_bias=routing_bias,
+                hidden_states=hidden_states,
+                hidden_states_scale=hidden_states_scale,
+                gemm1_weights=w1f,
+                gemm1_weights_scale=w1s,
+                gemm1_bias=None,
+                gemm1_alpha=None,
+                gemm1_beta=None,
+                gemm1_clamp_limit=None,
+                gemm2_weights=w2f,
+                gemm2_weights_scale=w2s,
+                gemm2_bias=None,
+                output1_scale_scalar=sc,
+                output1_scale_gate_scalar=sc,
+                output2_scale_scalar=sc,
+                num_experts=CFG.num_experts,
+                top_k=CFG.top_k,
+                n_group=CFG.n_group,
+                topk_group=CFG.topk_group,
+                intermediate_size=CFG.intermediate_size,
+                local_expert_offset=local_expert_offset,
+                local_num_experts=num_local_experts,
+                routed_scaling_factor=CFG.routed_scaling_factor,
+                routing_method_type=RoutingMethodType.DeepSeekV3,
+                do_finalize=True,
+            )
 
     input_kwargs = {
         "routing_logits": inputs["router_logits"],
@@ -591,15 +671,32 @@ def bench_trtllm(
     run(**input_kwargs)
     torch.cuda.synchronize()
 
-    times = bench_gpu_time(
-        run,
-        dry_run_iters=warmup,
-        repeat_iters=iters,
-        cold_l2_cache=True,
-        enable_cupti=use_cupti,
-        use_cuda_graph=use_cuda_graph,
-        input_kwargs=input_kwargs,
-    )
+    # See bench_cute_dsl for commentary on the optional NVTX wrap.
+    def _timed():
+        return bench_gpu_time(
+            run,
+            dry_run_iters=warmup,
+            repeat_iters=iters,
+            cold_l2_cache=True,
+            enable_cupti=use_cupti,
+            use_cuda_graph=use_cuda_graph,
+            input_kwargs=input_kwargs,
+        )
+
+    if nvtx_profile_region:
+        torch.cuda.cudart().cudaProfilerStart()
+        try:
+            with torch.cuda.nvtx.range(f"bench_trtllm_n{n}"):
+                times = _timed()
+        finally:
+            torch.cuda.cudart().cudaProfilerStop()
+        print(
+            f"[nvtx] bench_trtllm_n{n}: captured iters={len(times)}, "
+            f"median={float(np.median(times)):.3f} ms",
+            flush=True,
+        )
+    else:
+        times = _timed()
     return np.median(times)
 
 
@@ -634,6 +731,7 @@ def run_benchmark(
     use_cupti=True,
     use_wrapper=True,
     routing_bias_scale=0.01,
+    nvtx_profile_region=False,
 ):
     """
     Unified benchmark for DeepSeek-V3 MoE backends.
@@ -688,6 +786,7 @@ def run_benchmark(
                 use_cupti,
                 use_wrapper=use_wrapper,
                 routing_bias_scale=routing_bias_scale,
+                nvtx_profile_region=nvtx_profile_region,
             )
             results.extend(row)
             rows_and_histograms.append((row, histogram_record))
@@ -717,11 +816,13 @@ def _benchmark_single(
     use_cupti,
     use_wrapper=True,
     routing_bias_scale=0.01,
+    nvtx_profile_region=False,
 ):
     """Benchmark all backends for a single token count.
 
     Args:
         use_wrapper: If True, use CuteDslMoEWrapper API for CuteDSL.
+        nvtx_profile_region: Forwarded to each bench_* function.
     """
     inputs = create_inputs(n, routing_bias_scale=routing_bias_scale)
     histogram_record = _collect_expert_histogram(inputs, num_local, local_offset)
@@ -737,12 +838,27 @@ def _benchmark_single(
             use_cuda_graph,
             use_cupti,
             use_wrapper=use_wrapper,
+            nvtx_profile_region=nvtx_profile_region,
         ),
         "CUTLASS": bench_cutlass(
-            inputs, warmup, iters, num_local, local_offset, use_cuda_graph, use_cupti
+            inputs,
+            warmup,
+            iters,
+            num_local,
+            local_offset,
+            use_cuda_graph,
+            use_cupti,
+            nvtx_profile_region=nvtx_profile_region,
         ),
         "TRTLLM": bench_trtllm(
-            inputs, warmup, iters, num_local, local_offset, use_cuda_graph, use_cupti
+            inputs,
+            warmup,
+            iters,
+            num_local,
+            local_offset,
+            use_cuda_graph,
+            use_cupti,
+            nvtx_profile_region=nvtx_profile_region,
         ),
     }
 
@@ -935,6 +1051,18 @@ def main():
         default=0.01,
         help="Scale for random routing bias. Larger values tend to create expert imbalance.",
     )
+    parser.add_argument(
+        "--nvtx-profile-region",
+        action="store_true",
+        help="Wrap each backend's bench_gpu_time measurement with "
+        "cudaProfilerStart/Stop and an outer NVTX range "
+        "`bench_<backend>_n<N>`.  Fine-grained inner ranges "
+        "(`iter_<backend>`, `topk_<backend>`, `moe_<backend>`) are "
+        "always emitted regardless of this flag.  Pair with "
+        "`nsys profile --capture-range=cudaProfilerApi "
+        "--capture-range-end=repeat-shutdown:3` to record only the "
+        "measurement iters for all three backends in one run.",
+    )
     args = parser.parse_args()
 
     if not is_sm100_family():
@@ -964,6 +1092,7 @@ def main():
         use_cupti=not args.no_cupti,
         use_wrapper=not args.functional_api,
         routing_bias_scale=args.routing_bias_scale,
+        nvtx_profile_region=args.nvtx_profile_region,
     )
 
     return 0
